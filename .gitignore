@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+.eggs/
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+.vscode
+.claude
+
+# UV
+uv.lock
+
+# IDE
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# MLflow
+#mlflow.db
+mlruns/
+
+# Logs
+*.log
+
+# Runtime SQLite — accumulates session data, regenerated on server start
+backend/monitor_logs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Node (for frontend if using npm)
+node_modules/
+
+.claude/settings.local.json
+.claude/settings.local.json
+.vscode/settings.json
+.vscode/
+.claude/

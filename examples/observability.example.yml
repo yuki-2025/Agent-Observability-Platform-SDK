@@ -1,0 +1,55 @@
+# Example agent observability config.
+#
+# Copy this to your agent's repo (e.g. as `observability.yml`) and edit.
+# Pass the path to obs.init_agent("observability.yml") at process startup.
+
+agent:
+  agent_id: my_agent                   # unique across all Propio agents
+  agent_name: My Example Agent         # human-readable
+  agent_type: chat_agent               # realtime_agent | chat_agent | tool_agent | batch | workflow
+  modality: text                       # text | voice | multimodal
+  service: my-service                  # matches Datadog `service` tag (when DD added)
+  version: ""                          # deploy version, e.g. git short sha
+  default_tags:
+    team: ai-platform
+    env: dev                           # dev | staging | prod
+
+# Product metrics this agent commits to producing (LangSmith evaluators populate these).
+quality_metrics:
+  - task_success
+  - answer_grounded
+
+# Voice-specific numeric metrics (only meaningful when modality: voice).
+voice_metrics:
+  - first_audio_ms
+  - asr_latency_ms
+  - barge_in_success
+
+backends:
+  langsmith:
+    enabled: true
+    api_key_env: LANGSMITH_API_KEY     # SDK reads this env var
+    project: propio-agent              # LangSmith project name
+    endpoint: https://api.smith.langchain.com
+
+  postgres_db:                         # internal Postgres event-mirror DB
+    enabled: true                      # default — every agent gets it
+    # url_env unset → SDK picks POSTGRES_DB_URL_<environment> from platform_defaults
+
+# Channel routing — which backends receive which event categories.
+# v0 only LangSmith is wired up; other channels are placeholders.
+routing:
+  llm_trace:    [langsmith]
+  tool_call:    [langsmith]
+  voice_event:  [langsmith]
+  quality:      [langsmith]
+  # apm_span / log / metric — added when Datadog backend ships in v0.1
+
+behavior:
+  async_export: true
+  export_queue_size: 1000
+  export_timeout_ms: 5000
+  sampling:                            # 100% across the board for v0
+    llm_trace: 1.0
+    voice_event: 1.0
+    log: 1.0
