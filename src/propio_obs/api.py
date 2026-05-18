@@ -374,6 +374,57 @@ def finish_request(
     )
 
 
+# ─── 7. Session lifecycle + event mirror (PG-backed) ─────────────
+# These verbs delegate to the postgres_db exporter. They replace propio_one's
+# monitor_service.start_session / end_session / broadcast — same SQL, same
+# pg_notify pattern, but driven from the SDK so every agent gets it.
+
+async def start_session(
+    session_id: str,
+    *,
+    config: Optional[Dict[str, Any]] = None,
+    env: Optional[str] = None,
+    agent_id: Optional[str] = None,
+) -> None:
+    """Register a new monitored session in Postgres + start its heartbeat.
+
+    `agent_id` defaults to the configured agent. `env` defaults to the
+    configured environment. Idempotent on session_id collision.
+    """
+    resolved_agent_id = agent_id or (_config.agent.agent_id if _config else None)
+    resolved_env = env or (_config.agent.environment if _config else None)
+    await _postgres_db.start_session(
+        session_id,
+        config=config,
+        env=resolved_env,
+        agent_id=resolved_agent_id,
+    )
+
+
+async def end_session(session_id: str) -> None:
+    """Mark a session ended + cancel its heartbeat."""
+    await _postgres_db.end_session(session_id)
+
+
+async def broadcast_event(
+    event: Dict[str, Any],
+    *,
+    session_id: str,
+    agent_id: Optional[str] = None,
+) -> None:
+    """Fire-and-forget INSERT of a pipeline event into Postgres + pg_notify.
+
+    Returns immediately — the actual SQL runs in a background task. Listeners
+    (observability_platform) consume via the 'monitor_events' notify channel.
+    """
+    resolved_agent_id = agent_id or (_config.agent.agent_id if _config else None)
+    await _postgres_db.broadcast_event(
+        event,
+        session_id=session_id,
+        agent_id=resolved_agent_id,
+    )
+
+
 # ─── Helpers ─────────────────────────────────────────────────────
 def wrap_llm_client(client: Any) -> Any:
     """Wrap an OpenAI / AsyncOpenAI client for auto-tracing.

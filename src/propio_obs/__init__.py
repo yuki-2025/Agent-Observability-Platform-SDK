@@ -19,6 +19,11 @@ from .api import (
     finish_request,
     flush,
     wrap_llm_client,
+    # PG-backed session lifecycle + event mirror (Phase 1 of SDK takeover
+    # from monitor_service.py)
+    start_session,
+    end_session,
+    broadcast_event,
 )
 from .audio import pcm16_to_wav
 from .request import Request
@@ -46,6 +51,10 @@ __all__ = [
     "record_voice_event",
     "finish_request",
     "flush",
+    # PG event mirror + session lifecycle (replaces monitor_service)
+    "start_session",
+    "end_session",
+    "broadcast_event",
     # Helpers
     "wrap_llm_client",
     "pcm16_to_wav",

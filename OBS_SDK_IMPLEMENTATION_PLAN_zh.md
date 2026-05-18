@@ -803,16 +803,55 @@ Observability 平台查询路径：
 
 平台快（不 LIST S3），存储便宜。
 
-### 8.5 Propio 内部 DB —— 事件镜像（跟音频索引分开）
+### 8.5 Postgres event mirror —— SDK 接管 `monitor_service`
 
-不是 `audio_index_pg`。这是现有 `monitor_logs.db`，给现有实时 monitor 前端用的。Schema 复用：
+> **当前状态**（v0.0.4 Phase 2 done）：SDK 是 propio_one 唯一的 PG 写入路径。`monitor_service.py` 已删除。所有 `sessions` / `logs` 行都带 `agent_id='propio_agent_pro'`（历史 NULL 行可手动回填）。
+
+SDK 写入跟 propio_one 现有 `monitor_service.py` 完全等价的两张表（同一 PG 实例）：
 
 ```sql
-CREATE TABLE IF NOT EXISTS sessions (...);
-CREATE TABLE IF NOT EXISTS logs (...);
+-- sessions（已有 + 加 agent_id 列）
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS agent_id TEXT;
+
+-- logs（同上）
+ALTER TABLE logs ADD COLUMN IF NOT EXISTS agent_id TEXT;
 ```
 
-这个 DB 是 agent 本地的（适合实时调试），**不是**分析 source of truth —— 那是 OTel pipeline。v1 保留是因为现有 monitor 依赖。
+Migration SQL 在 `obs_sdk/migrations/002_agent_id_columns.sql`，由 obs_platform ops 跑（沿用 `001_init.sql` 的部署路径，agent 运行账号不用 CREATE/ALTER 权限）。
+
+#### SDK 新 verb（替代 `monitor_service.*`）
+
+| Verb | 做啥 | 对应 monitor_service |
+|---|---|---|
+| `obs.start_session(session_id, *, config, env, agent_id=None)` | INSERT `sessions` 行 + 启 heartbeat task | `start_session` |
+| `obs.end_session(session_id)` | UPDATE `sessions` 标 ended + 取消 heartbeat | `end_session` |
+| `obs.broadcast_event(event, *, session_id, agent_id=None)` | fire-and-forget INSERT `logs` + `pg_notify('monitor_events', id)` | `broadcast` |
+
+`agent_id` 默认从 `_config.agent.agent_id` 兜底；`env` 默认 `_config.agent.environment`。
+
+#### Phase 1（双写）→ Phase 2（切换）
+
+**Phase 1**（done）：
+- `propio_one/backend/app/routers/propio_websocket.py` 在每个 `monitor_service.*` 调用旁加 `obs.*`
+- 同一 turn 的事件会在 `logs` 表出现两行：一行 `agent_id IS NULL`（来自 monitor_service），一行 `agent_id='propio_agent_pro'`（来自 SDK）
+- 验证：propio_voice 实测下 logs 表 `NULL` 数和 `propio_agent_pro` 数 1:1 匹配
+- 修了一个 bug：start_session 用 `ON CONFLICT (id) DO UPDATE SET agent_id = EXCLUDED.agent_id WHERE sessions.agent_id IS NULL` 而不是 `DO NOTHING`，让 SDK 即便撞 PK 冲突也能回填 agent_id
+
+**Phase 2**（done）：
+- propio_websocket.py 删了所有 `monitor_service.*` 调用，只剩 `obs.*`
+- `propio_one/backend/app/services/monitor_service.py` 文件删除
+- `_new_session_id()` 内联到 propio_websocket.py（UUID-based，格式 `session-<UTC ts>-<6 hex>`）
+- 所有新 sessions / logs 行都带 `agent_id`，旧 NULL 行可用 UPDATE 回填
+
+#### 失败隔离
+
+- `init_agent()` 时 pool **没真建** —— lazy 到 `_ensure_pool()` 第一次写时建（init_agent 是 sync caller，但 pool 创建需要 event loop）
+- 任何 INSERT/UPDATE 失败 → 仅 logger.error，**不**抛给 agent
+- 没设 `POSTGRES_DB_URL_<env>` env → 整个 exporter inert，agent 正常跑（monitor_service 还在工作）
+
+#### 不是分析 source of truth
+
+这个 PG mirror 还是给**实时 monitor / agent 本地调试**用。**跨 agent / 跨 tenant 分析** 需要单独的 `request_summary` rollup 表（plan §3.5），v1 延后到第二个 agent 上 SDK 之后再加 —— 现在只有 propio 一个 agent，加了没用户。
 
 ---
 

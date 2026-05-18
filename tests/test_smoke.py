@@ -598,6 +598,150 @@ def test_datadog_logs_handler_attaches_and_formats(monkeypatch):
         dl.shutdown()
 
 
+def test_postgres_db_verbs_exported():
+    """New session/event verbs must be importable from the top-level package."""
+    import propio_obs
+
+    for attr in ("start_session", "end_session", "broadcast_event"):
+        assert hasattr(propio_obs, attr), f"missing export: {attr}"
+
+
+def test_postgres_db_disabled_is_noop():
+    """When postgres_db is disabled (no URL), verbs are silent no-ops."""
+    import asyncio
+
+    from propio_obs.exporters.postgres_db import PostgresDBExporter
+
+    exp = PostgresDBExporter()
+    assert exp.enabled is False  # default
+
+    async def _run():
+        await exp.start_session("s1", config={}, env="dev", agent_id="a")
+        await exp.broadcast_event({"type": "test"}, session_id="s1", agent_id="a")
+        await exp.end_session("s1")
+
+    asyncio.run(_run())  # must not raise
+
+
+def test_postgres_db_broadcast_emits_expected_sql(monkeypatch):
+    """When enabled with a mocked asyncpg pool, broadcast_event INSERTs into
+    logs with agent_id + fires pg_notify."""
+    import asyncio
+
+    from propio_obs.exporters import postgres_db as pg_mod
+
+    captured: list = []
+
+    class FakeConn:
+        async def execute(self, sql, *args):
+            captured.append((sql, args))
+
+        async def __aenter__(self): return self
+        async def __aexit__(self, *exc): return False
+
+    class FakeAcquire:
+        def __init__(self, conn): self.conn = conn
+        async def __aenter__(self): return self.conn
+        async def __aexit__(self, *exc): return False
+
+    class FakePool:
+        def __init__(self): self.conn = FakeConn()
+        def acquire(self): return FakeAcquire(self.conn)
+        async def close(self): pass
+
+    class FakeAsyncpg:
+        @staticmethod
+        async def create_pool(*args, **kwargs): return FakePool()
+
+    monkeypatch.setattr(pg_mod, "_asyncpg", FakeAsyncpg)
+
+    exp = pg_mod.PostgresDBExporter()
+    # Bypass real env-var lookup
+    exp.enabled = True
+    exp.url = "postgresql://test"
+
+    async def _run():
+        await exp.broadcast_event(
+            {"type": "user_transcript", "text": "hello"},
+            session_id="sess-1",
+            agent_id="propio_agent_pro",
+        )
+        # broadcast is fire-and-forget — drain pending tasks before assert
+        if exp._pending_writes:
+            await asyncio.wait(exp._pending_writes)
+
+    asyncio.run(_run())
+
+    # Should have run exactly the INSERT logs + pg_notify SQL with our args.
+    assert len(captured) == 1
+    sql, args = captured[0]
+    assert "INSERT INTO logs" in sql
+    assert "pg_notify('monitor_events'" in sql
+    assert "agent_id" in sql
+    # Args: (session_id, ts, event_type, payload, agent_id)
+    assert args[0] == "sess-1"
+    assert args[2] == "user_transcript"
+    assert args[4] == "propio_agent_pro"
+
+
+def test_postgres_db_start_session_inserts_with_agent_id(monkeypatch):
+    """start_session INSERTs the sessions row with agent_id populated."""
+    import asyncio
+
+    from propio_obs.exporters import postgres_db as pg_mod
+
+    captured: list = []
+
+    class FakeConn:
+        async def execute(self, sql, *args):
+            captured.append((sql, args))
+
+    class FakeAcquire:
+        def __init__(self, conn): self.conn = conn
+        async def __aenter__(self): return self.conn
+        async def __aexit__(self, *exc): return False
+
+    class FakePool:
+        def __init__(self): self.conn = FakeConn()
+        def acquire(self): return FakeAcquire(self.conn)
+        async def close(self): pass
+
+    class FakeAsyncpg:
+        @staticmethod
+        async def create_pool(*args, **kwargs): return FakePool()
+
+    monkeypatch.setattr(pg_mod, "_asyncpg", FakeAsyncpg)
+
+    exp = pg_mod.PostgresDBExporter()
+    exp.enabled = True
+    exp.url = "postgresql://test"
+
+    async def _run():
+        await exp.start_session(
+            "sess-1",
+            config={"foo": "bar"},
+            env="dev",
+            agent_id="propio_agent_pro",
+        )
+        # End-session cancels the heartbeat we just kicked.
+        await exp.end_session("sess-1")
+
+    asyncio.run(_run())
+
+    # Should have two INSERTs/UPDATEs — one start, one end.
+    assert len(captured) >= 2
+    start_sql, start_args = captured[0]
+    assert "INSERT INTO sessions" in start_sql
+    assert "agent_id" in start_sql
+    # Args order from SQL: ($1=id, $2=ts, $3=config_str, $4=env, $5=agent_id)
+    assert start_args[0] == "sess-1"          # id
+    assert start_args[3] == "dev"             # env
+    assert start_args[4] == "propio_agent_pro"  # agent_id
+
+    end_sql, _ = captured[1]
+    assert "UPDATE sessions" in end_sql
+
+
 def test_traceable_rechecks_enabled_at_call_time():
     """Regression: ENABLED can flip True *after* a function is decorated
     (init_agent() runs at lifespan startup, but record_stt / record_tts are
