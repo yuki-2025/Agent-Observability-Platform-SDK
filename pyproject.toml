@@ -9,11 +9,18 @@ readme = "README.md"
 dependencies = [
     "pyyaml>=6.0",
     "pydantic>=2.7",
-    # Optional backends are loaded lazily inside exporter modules so a partial install works.
-    # Listed as full deps for v0 since propio uses all four:
+    # OpenTelemetry — single wire format for traces + logs. Collector relay
+    # handles fan-out to Datadog / LangSmith.
+    "opentelemetry-api>=1.25",
+    "opentelemetry-sdk>=1.25",
+    "opentelemetry-exporter-otlp-proto-http>=1.25",
+    # OpenAI auto-instrumentation — replaces langsmith.wrappers.wrap_openai
+    "opentelemetry-instrumentation-openai-v2>=2.0.0b0",
+    # asyncpg for postgres_db exporter (not OTel — domain events DB)
+    "asyncpg>=0.29",
+    # Kept for backwards compatibility with back-compat function-level API
+    # (record_stt / record_tts / turn_trace). New code should not use these.
     "langsmith>=0.7",
-    "ddtrace>=2.0",
-    "datadog-api-client>=2.0",
 ]
 
 [project.optional-dependencies]

@@ -94,8 +94,9 @@ def test_config_invalid_environment_rejected(monkeypatch):
         )
 
 
-def test_config_langsmith_project_falls_back_to_agent_id(monkeypatch):
-    """Unset project + no env → agent.agent_id."""
+def test_config_langsmith_project_falls_back_to_agent_id_env(monkeypatch):
+    """Unset project + no env var → {agent_id}-{environment} so prod/dev
+    are isolated LangSmith projects."""
     from propio_obs.config import AgentConfig
 
     monkeypatch.delenv("LANGSMITH_PROJECT", raising=False)
@@ -105,7 +106,7 @@ def test_config_langsmith_project_falls_back_to_agent_id(monkeypatch):
             "backends": {"langsmith": {"enabled": True}},
         }
     )
-    assert cfg.backends.langsmith.project == "support_voice"
+    assert cfg.backends.langsmith.project == "support_voice-prod"
 
 
 def test_config_langsmith_project_env_var_wins_over_fallback(monkeypatch):
@@ -192,6 +193,16 @@ def test_config_platform_defaults_baked_in():
     assert cfg.backends.langsmith.api_key_env == pd.LANGSMITH_API_KEY_ENV
 
 
+def test_config_otel_default_collector_endpoint():
+    """OTel section defaults to localhost:4318 for local Collector."""
+    from propio_obs.config import AgentConfig
+
+    cfg = AgentConfig.load(
+        {"agent": {"agent_id": "a", "service": "s", "environment": "dev"}}
+    )
+    assert cfg.otel.collector_endpoint == "http://localhost:4318"
+
+
 def test_request_handle():
     from propio_obs import Request
 
@@ -201,89 +212,39 @@ def test_request_handle():
     assert r.metadata == {}
 
 
-def test_verb_layer_emits_parent_child_runs(monkeypatch):
-    """start_request opens a parent RunTree; record_voice_event creates
-    children on it; finish_request ends + patches the parent. Verified by
-    monkey-patching the langsmith primitives."""
-    from propio_obs import api as obs_api
+# ──────────────────────────────────────────────────────────────
+# OTel verb-layer tests
+# ──────────────────────────────────────────────────────────────
+
+def _setup_in_memory_tracer(monkeypatch):
+    """Helper: install an in-memory OTel exporter on the SDK's tracer slot.
+    Returns the exporter so tests can pull captured spans."""
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    from propio_obs import otel_init
     from propio_obs.exporters import langsmith as ls
 
-    class FakeChild:
-        def __init__(self, name, run_type, inputs):
-            self.name = name
-            self.run_type = run_type
-            self.inputs = inputs
-            self.attachments = {}
-            self.outputs = None
-            self.error = None
-            self.posted = False
-            self.patched = False
-            self.metadata = {}
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test")
 
-        def add_metadata(self, md):
-            self.metadata.update(md)
+    monkeypatch.setattr(otel_init, "_tracer", tracer)
+    monkeypatch.setattr(otel_init, "ENABLED", True)
+    monkeypatch.setattr(ls, "ENABLED", True)  # enables langsmith decoration
+    return exporter
 
-        def end(self, outputs=None, error=None):
-            self.outputs = outputs
-            self.error = error
 
-        def post(self):
-            self.posted = True
+def test_verb_layer_emits_otel_spans(monkeypatch):
+    """start_request → record_voice_event → record_tool → finish_request emits
+    one parent OTel span with two children; correlation attributes carry through."""
+    from propio_obs import api as obs_api
 
-        def patch(self):
-            self.patched = True
-
-    class FakeRunTree:
-        instances = []
-
-        def __init__(self, **data):
-            self.name = data.get("name")
-            self.run_type = data.get("run_type")
-            self.inputs = data.get("inputs", {})
-            self.extra = data.get("extra", {})
-            self.children = []
-            self.ended = False
-            self.patched = False
-            self.end_outputs = None
-            self.end_error = None
-            FakeRunTree.instances.append(self)
-
-        def post(self):
-            self.posted = True
-
-        def create_child(self, name, run_type, inputs):
-            c = FakeChild(name, run_type, inputs)
-            self.children.append(c)
-            return c
-
-        def end(self, outputs=None, error=None):
-            self.ended = True
-            self.end_outputs = outputs
-            self.end_error = error
-
-        def patch(self):
-            self.patched = True
-
-    class FakeCM:
-        def __init__(self, *, parent=None, project_name=None):
-            self.parent = parent
-            self.entered = False
-            self.exited = False
-
-        def __enter__(self):
-            self.entered = True
-            return self
-
-        def __exit__(self, *exc):
-            self.exited = True
-            return False
-
-    FakeRunTree.instances.clear()
-
-    monkeypatch.setattr(ls, "ENABLED", True)
-    monkeypatch.setattr(ls, "_RunTree", FakeRunTree)
-    monkeypatch.setattr(ls, "_tracing_context", lambda **kw: FakeCM(**kw))
-    # Real Attachment OK to keep — not exercised when audio_wav is None.
+    exporter = _setup_in_memory_tracer(monkeypatch)
 
     req = obs_api.start_request(
         "voice_turn",
@@ -291,184 +252,83 @@ def test_verb_layer_emits_parent_child_runs(monkeypatch):
         inputs={"transcript": "hi"},
         metadata={"tenant_id": "hospital_a"},
     )
-    assert "run_tree" in req._state
-    parent = req._state["run_tree"]
-    assert parent.name == "agent.request"
-    assert parent.inputs == {"transcript": "hi"}
-    assert parent.extra["metadata"]["session_id"] == "sess-1"
-    assert parent.extra["metadata"]["tenant_id"] == "hospital_a"
-    assert req._state["tracing_cm"].parent is parent
-    assert req._state["tracing_cm"].entered is True
-
     obs_api.record_voice_event(
-        req,
-        "asr_finalized",
+        req, "asr_finalized",
         metrics={"asr_latency_ms": 280},
         metadata={"provider": "deepgram"},
     )
-    assert len(parent.children) == 1
-    child = parent.children[0]
-    assert child.name == "voice.asr_finalized"
-    assert child.run_type == "tool"
-    assert child.inputs["metrics"] == {"asr_latency_ms": 280}
-    assert child.inputs["provider"] == "deepgram"
-    assert child.outputs == {"event": "asr_finalized", "audio_bytes": None}
-    assert child.posted and child.patched
-
     obs_api.record_tool(req, "my_tool", input={"q": 1}, output={"r": 2})
-    assert len(parent.children) == 2
-    tool_child = parent.children[1]
-    assert tool_child.name == "tool.my_tool"
-    assert tool_child.outputs == {"output": {"r": 2}}
-
     obs_api.finish_request(req, status="success", outputs={"final": "done"})
-    assert parent.ended is True
-    # finish_request now stamps `status` into outputs so both backends can
-    # pivot on barge-in vs success without using the error flag.
-    assert parent.end_outputs == {"final": "done", "status": "success"}
-    assert parent.patched is True
-    assert req._state["tracing_cm"] if "tracing_cm" in req._state else True
-    # tracing_cm was popped from _state by finish_request
-    assert "run_tree" not in req._state
-    assert "tracing_cm" not in req._state
+
+    spans = exporter.get_finished_spans()
+    names = [s.name for s in spans]
+    assert "agent.request" in names
+    assert "voice.asr_finalized" in names
+    assert "tool.my_tool" in names
+
+    parent = next(s for s in spans if s.name == "agent.request")
+    # Correlation keys present on parent.
+    assert parent.attributes.get("session.id") == "sess-1"
+    assert parent.attributes.get("tenant.id") == "hospital_a"
+    assert parent.attributes.get("request.type") == "voice_turn"
+    assert parent.attributes.get("status") == "success"
+    assert parent.attributes.get("output.final") == "done"
+    # LangSmith conventions stamped.
+    assert parent.attributes.get("langsmith.span.kind") == "chain"
+    assert parent.attributes.get("langsmith.metadata.session_id") == "sess-1"
+
+    voice_span = next(s for s in spans if s.name == "voice.asr_finalized")
+    assert voice_span.attributes.get("voice.event") == "asr_finalized"
+    assert voice_span.attributes.get("voice.metrics.asr_latency_ms") == 280
+    assert voice_span.attributes.get("langsmith.span.kind") == "tool"
+    # Nests under the request span.
+    assert voice_span.parent.span_id == parent.context.span_id
+
+    tool_span = next(s for s in spans if s.name == "tool.my_tool")
+    assert tool_span.parent.span_id == parent.context.span_id
 
 
-def test_verb_layer_disabled_is_passive(monkeypatch):
-    """When LangSmith is disabled, start_request still returns a Request but
-    creates no run tree, and the other verbs are silent no-ops."""
+def test_verb_layer_otel_disabled_is_passive():
+    """When otel_init.setup() hasn't been called, all verbs are silent no-ops."""
     from propio_obs import api as obs_api
-    from propio_obs.exporters import langsmith as ls
+    from propio_obs import otel_init
 
-    monkeypatch.setattr(ls, "ENABLED", False)
+    # Belt + suspenders: ensure tracer slot is None.
+    assert otel_init.get_tracer() is None or not otel_init.ENABLED
 
     req = obs_api.start_request("voice_turn", session_id="s1")
-    assert req.session_id == "s1"
-    assert "run_tree" not in req._state
+    assert "span" not in req._state  # no OTel span was created
 
-    # Should not raise.
-    obs_api.record_voice_event(req, "asr_finalized", audio_wav=b"\x00\x01" * 16000)
+    # These must not raise.
+    obs_api.record_voice_event(req, "asr_finalized", audio_wav=b"\x00\x01" * 1000)
     obs_api.record_tool(req, "noop", input={}, output={})
     obs_api.finish_request(req, status="success")
 
 
-def test_datadog_fan_out_alongside_langsmith(monkeypatch):
-    """When both backends are enabled, every verb emits to both. Verified by
-    monkey-patching the dd module's primitives."""
+def test_audio_wav_drops_with_warning(monkeypatch, caplog):
+    """OTel migration loses LangSmith audio attachments. First time
+    record_voice_event sees audio_wav we log one warning, then silently
+    drop subsequent ones."""
     from propio_obs import api as obs_api
-    from propio_obs.exporters import datadog as dd
     from propio_obs.exporters import langsmith as ls
 
-    # ── LangSmith mocks (same shape as the parent/child test above) ──
-    class FakeChild:
-        def __init__(self, name, run_type, inputs):
-            self.name, self.inputs = name, inputs
-            self.attachments = {}
-
-        def add_metadata(self, md): pass
-        def end(self, outputs=None, error=None): pass
-        def post(self): pass
-        def patch(self): pass
-
-    class FakeRunTree:
-        def __init__(self, **data):
-            self.name = data.get("name")
-            self.children = []
-
-        def post(self): pass
-        def create_child(self, name, run_type, inputs):
-            c = FakeChild(name, run_type, inputs)
-            self.children.append(c)
-            return c
-        def end(self, outputs=None, error=None): pass
-        def patch(self): pass
-
-    class FakeCM:
-        def __init__(self, **kw): pass
-        def __enter__(self): return self
-        def __exit__(self, *exc): return False
-
-    # ── Datadog mocks ──
-    class FakeDDSpan:
-        def __init__(self, name, parent=None):
-            self.name = name
-            self.parent = parent
-            self.tags = {}
-            self.error = 0
-            self.finished = False
-            self.children: list = []
-
-        def set_tag(self, k, v):
-            self.tags[k] = v
-
-        def finish(self):
-            self.finished = True
-
-    class FakeTracer:
-        def __init__(self):
-            self.opened: list = []
-
-        def trace(self, name, resource=None, service=None, span_type=None):
-            s = FakeDDSpan(name)
-            self.opened.append(s)
-            return s
-
-        def start_span(self, name, child_of=None, resource=None, service=None,
-                       span_type=None, activate=True):
-            s = FakeDDSpan(name, parent=child_of)
-            if child_of is not None:
-                child_of.children.append(s)
-            return s
-
-    fake_tracer = FakeTracer()
+    # Reset the one-time flag in case other tests set it.
+    monkeypatch.setattr(ls, "_audio_warning_fired", False)
     monkeypatch.setattr(ls, "ENABLED", True)
-    monkeypatch.setattr(ls, "_RunTree", FakeRunTree)
-    monkeypatch.setattr(ls, "_tracing_context", lambda **kw: FakeCM(**kw))
-    monkeypatch.setattr(dd, "ENABLED", True)
-    monkeypatch.setattr(dd, "_tracer", fake_tracer)
-    monkeypatch.setattr(dd, "_service", "test-svc")
-    monkeypatch.setattr(dd, "_env", "dev")
-
-    req = obs_api.start_request("voice_turn", session_id="s1", inputs={"x": 1})
-
-    # Both backends should have stashed parent handles on the request
-    assert "run_tree" in req._state
-    assert "dd_span" in req._state
-    parent_dd = req._state["dd_span"]
-    assert parent_dd.name == "agent.request"
-    assert parent_dd.tags.get("env") == "dev"
-
-    obs_api.record_voice_event(req, "asr_finalized", metrics={"latency_ms": 250})
-    assert len(parent_dd.children) == 1
-    child = parent_dd.children[0]
-    assert child.name == "voice.asr_finalized"
-    assert child.tags.get("input.event") == "asr_finalized"
-    assert child.finished is True
-
-    obs_api.record_tool(req, "my_tool", input={"q": 1}, output={"r": 2})
-    assert len(parent_dd.children) == 2
-    assert parent_dd.children[1].name == "tool.my_tool"
-
-    obs_api.finish_request(req, status="success", outputs={"final": "ok"})
-    assert parent_dd.finished is True
-    assert parent_dd.tags.get("output.final") == "ok"
-    assert "dd_span" not in req._state
-
-
-def test_datadog_disabled_is_passive(monkeypatch):
-    """LangSmith on, Datadog off → only LangSmith fires; no errors."""
-    from propio_obs import api as obs_api
-    from propio_obs.exporters import datadog as dd
-    from propio_obs.exporters import langsmith as ls
-
-    monkeypatch.setattr(ls, "ENABLED", False)  # both off to test no-op path
-    monkeypatch.setattr(dd, "ENABLED", False)
+    _setup_in_memory_tracer(monkeypatch)
 
     req = obs_api.start_request("voice_turn", session_id="s1")
-    assert "dd_span" not in req._state
-    obs_api.record_voice_event(req, "asr_finalized")
-    obs_api.record_tool(req, "noop", input={}, output={})
-    obs_api.finish_request(req, status="success")  # no raise
+    with caplog.at_level("WARNING", logger="propio_obs.exporters.langsmith"):
+        obs_api.record_voice_event(req, "asr_finalized", audio_wav=b"\x00\x01" * 100)
+    obs_api.finish_request(req)
 
+    # At least one warning mentions dropped audio.
+    assert any("OTel migration dropped LangSmith attachments" in r.message for r in caplog.records)
+
+
+# ──────────────────────────────────────────────────────────────
+# Datadog config (post-migration: backend config is mostly toggle)
+# ──────────────────────────────────────────────────────────────
 
 def test_datadog_backend_pydantic_defaults():
     from propio_obs.config import AgentConfig
@@ -515,88 +375,9 @@ def test_datadog_logs_default_off():
     assert cfg.backends.datadog_logs.enabled is False
 
 
-def test_datadog_logs_handler_attaches_and_formats(monkeypatch):
-    """When configure() runs, a handler attaches to root logger and emit()
-    pipes records through _format_log → HTTPLogItem."""
-    import logging as _logging
-
-    from propio_obs.exporters import datadog_logs as dl
-
-    # Reset module state so a fresh configure() succeeds.
-    monkeypatch.setattr(dl, "ENABLED", False)
-    monkeypatch.setattr(dl, "_handler", None)
-
-    # Stub out the DD API client primitives so no real HTTPS calls happen.
-    class FakeApiClient:
-        def __init__(self, cfg): self.cfg = cfg
-        def close(self): pass
-
-    class FakeConfig:
-        def __init__(self):
-            self.api_key = {}
-            self.server_variables = {}
-
-    class FakeLogsApi:
-        def __init__(self, client): pass
-        def submit_log(self, body=None): pass
-
-    captured_items: list = []
-
-    class FakeHTTPLogItem:
-        def __init__(self, **kw):
-            captured_items.append(kw)
-            for k, v in kw.items():
-                setattr(self, k, v)
-
-    monkeypatch.setattr(dl, "_ApiClient", FakeApiClient)
-    monkeypatch.setattr(dl, "_Configuration", FakeConfig)
-    monkeypatch.setattr(dl, "_LogsApi", FakeLogsApi)
-    monkeypatch.setattr(dl, "_HTTPLogItem", FakeHTTPLogItem)
-    monkeypatch.setattr(dl, "_HTTPLog", lambda batch: batch)
-    monkeypatch.setattr(dl, "_unset", object())
-    # Bypass real import — we just installed the stubs above.
-    monkeypatch.setattr(dl, "_try_import_datadog_api_client", lambda: True)
-
-    dl.configure(
-        enabled=True,
-        api_key="fake-key",
-        site="datadoghq.com",
-        service="svc",
-        env="dev",
-        agent_id="propio_agent_pro",
-        min_level=_logging.DEBUG,
-        exclude_loggers=["ddtrace"],
-    )
-    try:
-        assert dl.ENABLED is True
-        assert dl._handler is not None
-        # Handler is attached to root logger.
-        assert dl._handler in _logging.getLogger().handlers
-
-        # Emit a record — _format_log should run and produce one HTTPLogItem.
-        record = _logging.LogRecord(
-            name="myapp", level=_logging.INFO, pathname="x.py", lineno=1,
-            msg="hello %s", args=("world",), exc_info=None,
-        )
-        dl._handler._format_log(record)
-        assert len(captured_items) == 1
-        item = captured_items[0]
-        assert item["service"] == "svc"
-        assert "env:dev" in item["ddtags"]
-        assert "service:svc" in item["ddtags"]
-        assert "agent.id:propio_agent_pro" in item["ddtags"]
-
-        # Excluded loggers are filtered at emit() time, not _format_log.
-        excluded = _logging.LogRecord(
-            name="ddtrace.tracer", level=_logging.INFO, pathname="x.py", lineno=1,
-            msg="internal noise", args=(), exc_info=None,
-        )
-        before = len(captured_items)
-        dl._handler.emit(excluded)
-        assert len(captured_items) == before  # filtered out
-    finally:
-        dl.shutdown()
-
+# ──────────────────────────────────────────────────────────────
+# Postgres event-mirror (asyncpg, unchanged by OTel migration)
+# ──────────────────────────────────────────────────────────────
 
 def test_postgres_db_verbs_exported():
     """New session/event verbs must be importable from the top-level package."""
@@ -623,21 +404,13 @@ def test_postgres_db_disabled_is_noop():
     asyncio.run(_run())  # must not raise
 
 
-def test_postgres_db_broadcast_emits_expected_sql(monkeypatch):
-    """When enabled with a mocked asyncpg pool, broadcast_event INSERTs into
-    logs with agent_id + fires pg_notify."""
-    import asyncio
-
+def _install_fake_asyncpg(monkeypatch, captured):
+    """Shared fixture: install a fake asyncpg pool that records executed SQL."""
     from propio_obs.exporters import postgres_db as pg_mod
-
-    captured: list = []
 
     class FakeConn:
         async def execute(self, sql, *args):
             captured.append((sql, args))
-
-        async def __aenter__(self): return self
-        async def __aexit__(self, *exc): return False
 
     class FakeAcquire:
         def __init__(self, conn): self.conn = conn
@@ -654,9 +427,18 @@ def test_postgres_db_broadcast_emits_expected_sql(monkeypatch):
         async def create_pool(*args, **kwargs): return FakePool()
 
     monkeypatch.setattr(pg_mod, "_asyncpg", FakeAsyncpg)
+    return pg_mod
+
+
+def test_postgres_db_broadcast_emits_expected_sql(monkeypatch):
+    """When enabled with a mocked asyncpg pool, broadcast_event INSERTs into
+    logs with agent_id + fires pg_notify."""
+    import asyncio
+
+    captured: list = []
+    pg_mod = _install_fake_asyncpg(monkeypatch, captured)
 
     exp = pg_mod.PostgresDBExporter()
-    # Bypass real env-var lookup
     exp.enabled = True
     exp.url = "postgresql://test"
 
@@ -672,7 +454,6 @@ def test_postgres_db_broadcast_emits_expected_sql(monkeypatch):
 
     asyncio.run(_run())
 
-    # Should have run exactly the INSERT logs + pg_notify SQL with our args.
     assert len(captured) == 1
     sql, args = captured[0]
     assert "INSERT INTO logs" in sql
@@ -688,29 +469,8 @@ def test_postgres_db_start_session_inserts_with_agent_id(monkeypatch):
     """start_session INSERTs the sessions row with agent_id populated."""
     import asyncio
 
-    from propio_obs.exporters import postgres_db as pg_mod
-
     captured: list = []
-
-    class FakeConn:
-        async def execute(self, sql, *args):
-            captured.append((sql, args))
-
-    class FakeAcquire:
-        def __init__(self, conn): self.conn = conn
-        async def __aenter__(self): return self.conn
-        async def __aexit__(self, *exc): return False
-
-    class FakePool:
-        def __init__(self): self.conn = FakeConn()
-        def acquire(self): return FakeAcquire(self.conn)
-        async def close(self): pass
-
-    class FakeAsyncpg:
-        @staticmethod
-        async def create_pool(*args, **kwargs): return FakePool()
-
-    monkeypatch.setattr(pg_mod, "_asyncpg", FakeAsyncpg)
+    pg_mod = _install_fake_asyncpg(monkeypatch, captured)
 
     exp = pg_mod.PostgresDBExporter()
     exp.enabled = True
@@ -723,12 +483,10 @@ def test_postgres_db_start_session_inserts_with_agent_id(monkeypatch):
             env="dev",
             agent_id="propio_agent_pro",
         )
-        # End-session cancels the heartbeat we just kicked.
         await exp.end_session("sess-1")
 
     asyncio.run(_run())
 
-    # Should have two INSERTs/UPDATEs — one start, one end.
     assert len(captured) >= 2
     start_sql, start_args = captured[0]
     assert "INSERT INTO sessions" in start_sql
@@ -740,53 +498,3 @@ def test_postgres_db_start_session_inserts_with_agent_id(monkeypatch):
 
     end_sql, _ = captured[1]
     assert "UPDATE sessions" in end_sql
-
-
-def test_traceable_rechecks_enabled_at_call_time():
-    """Regression: ENABLED can flip True *after* a function is decorated
-    (init_agent() runs at lifespan startup, but record_stt / record_tts are
-    decorated at module import). The wrapper must observe the new ENABLED."""
-    import functools as _ft
-
-    from propio_obs.exporters import langsmith as ls
-
-    orig_enabled = ls.ENABLED
-    orig_ts = ls._langsmith_traceable
-    try:
-        # Simulate the bad-ordering case: tracing off at decoration time.
-        ls.ENABLED = False
-        ls._langsmith_traceable = None
-
-        @ls.traceable(name="my_fn", run_type="tool")
-        def my_fn(x):
-            return x * 2
-
-        assert my_fn(3) == 6  # no-op pass-through
-
-        # Now init_agent() runs and flips state. Install a fake traceable
-        # that records every call it intercepts.
-        calls = []
-
-        def fake_traceable(**deco_kwargs):
-            def _deco(fn):
-                @_ft.wraps(fn)
-                def _w(*a, **kw):
-                    calls.append((deco_kwargs.get("name"), a, kw))
-                    return fn(*a, **kw)
-
-                return _w
-
-            return _deco
-
-        ls.ENABLED = True
-        ls._langsmith_traceable = fake_traceable
-
-        assert my_fn(5) == 10
-        assert calls == [("my_fn", (5,), {})]
-
-        # Second call uses the cached wrapped fn — still traced.
-        assert my_fn(7) == 14
-        assert len(calls) == 2
-    finally:
-        ls.ENABLED = orig_enabled
-        ls._langsmith_traceable = orig_ts

@@ -101,6 +101,13 @@ class BehaviorSection(BaseModel):
     sampling: Dict[str, float] = Field(default_factory=lambda: {"llm_trace": 1.0})
 
 
+class OTelSection(BaseModel):
+    """OpenTelemetry wire configuration. Single Collector endpoint that
+    fan-outs to all SaaS backends (LangSmith / Datadog / future).
+    Defaults to `http://localhost:4318` for local docker compose."""
+    collector_endpoint: str = "http://localhost:4318"
+
+
 class AgentConfig(BaseModel):
     agent: AgentSection
     quality_metrics: List[str] = Field(default_factory=list)
@@ -108,6 +115,7 @@ class AgentConfig(BaseModel):
     backends: BackendsSection = Field(default_factory=BackendsSection)
     routing: Dict[str, List[str]] = Field(default_factory=dict)
     behavior: BehaviorSection = Field(default_factory=BehaviorSection)
+    otel: OTelSection = Field(default_factory=OTelSection)
 
     @classmethod
     def load(cls, source: Union[str, Path, Dict[str, Any]]) -> "AgentConfig":
@@ -146,11 +154,18 @@ class AgentConfig(BaseModel):
         self.agent.environment = env  # type: ignore[assignment]
 
     def _resolve_langsmith_project(self) -> None:
-        """project unset → LANGSMITH_PROJECT env → agent.agent_id."""
+        """project unset → LANGSMITH_PROJECT env → {agent_id}-{env}.
+
+        Per-env project gives prod hard isolation from dev/qa noise; explicit
+        project in init_agent() or LANGSMITH_PROJECT env still wins for agents
+        that want a custom name.
+        """
         if self.backends.langsmith.project:
             return
         env_project = os.environ.get(pd.LANGSMITH_PROJECT_ENV)
-        self.backends.langsmith.project = env_project or self.agent.agent_id
+        self.backends.langsmith.project = (
+            env_project or f"{self.agent.agent_id}-{self.agent.environment}"
+        )
 
     def _resolve_postgres_db_url_env(self) -> None:
         """url_env unset → per-env table lookup."""

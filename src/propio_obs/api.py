@@ -4,12 +4,21 @@ The 6 verbs:
     init_agent, start_request, record_tool, record_quality,
     record_voice_event, finish_request
 
+Plus session / event-mirror verbs (PG-backed):
+    start_session, end_session, broadcast_event
+
 Plus helpers:
     wrap_llm_client, flush
 
-In v0 these verbs are intentionally thin — they delegate most work to the
-LangSmith function-level API. The verb shape is the contract; internals get
-fleshed out in v0.1+ when the router + multi-backend dispatch lands.
+OTel migration note: all "trace-shaped" verbs (start_request /
+record_voice_event / record_tool / finish_request) now create OTel spans
+via the shared tracer in `propio_obs.otel_init`. Spans ship via OTLP HTTP
+to a Collector, which fan-outs to LangSmith + Datadog. No more per-exporter
+SDK calls — one wire path.
+
+The Postgres event-mirror verbs (start_session / broadcast_event /
+end_session) are unchanged — they write business events to a Postgres
+DB via asyncpg, not via OTel signals.
 """
 from __future__ import annotations
 
@@ -19,6 +28,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
+from . import otel_init
 from .audio import pcm16_to_wav
 from .config import AgentConfig
 from .exporters import datadog as dd
@@ -34,14 +44,14 @@ logger = logging.getLogger(__name__)
 # ─── Module state ────────────────────────────────────────────────
 _config: Optional[AgentConfig] = None
 _initialized: bool = False
-_session_tenant_cache: Dict[str, str] = {}  # session_id → tenant_id, for SDK propagation
+_session_tenant_cache: Dict[str, str] = {}
 _postgres_db = PostgresDBExporter()
 _atexit_registered: bool = False
 
 
 # ─── 1. init_agent ───────────────────────────────────────────────
 def init_agent(config: Union[str, Path, dict]) -> None:
-    """Load config, configure backends. Idempotent — call once at startup."""
+    """Load config, set up OTel + backend modules. Idempotent."""
     global _config, _initialized, _atexit_registered
 
     if _initialized:
@@ -50,53 +60,52 @@ def init_agent(config: Union[str, Path, dict]) -> None:
 
     _config = AgentConfig.load(config)
 
-    # Configure LangSmith from YAML if enabled
+    # 1. Bring up OTel (single shared tracer + logger). Every "trace" verb
+    #    below resolves to a span on this tracer.
+    otel_init.setup(
+        collector_endpoint=_config.otel.collector_endpoint,
+        service_name=_config.agent.service,
+        environment=_config.agent.environment,  # type: ignore[arg-type]
+        agent_id=_config.agent.agent_id,
+        agent_type=_config.agent.agent_type,
+        modality=_config.agent.modality,
+        version=_config.agent.version,
+    )
+
+    # 2. Register intent for each enabled backend. The Collector owns the
+    #    actual ship paths; these flags just gate which attribute
+    #    conventions the verb layer applies.
     ls_cfg = _config.backends.langsmith
     if ls_cfg.enabled:
-        api_key = _config.resolve_env(ls_cfg.api_key_env)
         ls.configure(
             enabled=True,
-            api_key=api_key,
             project=ls_cfg.project,
-            endpoint=ls_cfg.endpoint,
+            env=_config.agent.environment,  # type: ignore[arg-type]
         )
 
-    # Configure Datadog from config if enabled
     dd_cfg = _config.backends.datadog
     if dd_cfg.enabled:
-        dd_api_key = _config.resolve_env(dd_cfg.api_key_env)
         dd.configure(
             enabled=True,
-            api_key=dd_api_key,
-            site=dd_cfg.site,
             service=dd_cfg.service or _config.agent.service,
             env=dd_cfg.env_tag or _config.agent.environment,  # type: ignore[arg-type]
             version=dd_cfg.version,
-            agent_url=dd_cfg.agent_url,
         )
 
-    # Configure Datadog Logs (independent of APM)
     dl_cfg = _config.backends.datadog_logs
     if dl_cfg.enabled:
-        dl_api_key = _config.resolve_env(dl_cfg.api_key_env)
         dd_logs.configure(
             enabled=True,
-            api_key=dl_api_key,
-            site=dl_cfg.site,
             service=dl_cfg.service or _config.agent.service,
             env=dl_cfg.env_tag or _config.agent.environment,  # type: ignore[arg-type]
             version=dl_cfg.version,
-            agent_id=_config.agent.agent_id,
             min_level=getattr(logging, dl_cfg.min_level.upper(), logging.DEBUG),
             exclude_loggers=dl_cfg.exclude_loggers,
-            batch_size=dl_cfg.batch_size,
-            flush_interval_seconds=dl_cfg.flush_interval_seconds,
         )
 
-    # Postgres event-mirror stub — wires up env resolution; actual writes are in v0.1
+    # 3. Postgres event-mirror (asyncpg, NOT OTel — domain DB).
     _postgres_db.setup(_config.backends.postgres_db)
 
-    # Register atexit flush so long-running servers flush cleanly on shutdown
     if not _atexit_registered:
         atexit.register(flush)
         _atexit_registered = True
@@ -104,6 +113,7 @@ def init_agent(config: Union[str, Path, dict]) -> None:
     _initialized = True
     logger.info(
         f"[obs] init_agent OK (agent_id={_config.agent.agent_id}, "
+        f"otel={'on' if otel_init.ENABLED else 'off'}, "
         f"langsmith={'on' if ls.ENABLED else 'off'}, "
         f"datadog={'on' if dd.ENABLED else 'off'}, "
         f"datadog_logs={'on' if dd_logs.ENABLED else 'off'})"
@@ -120,17 +130,13 @@ def start_request(
     inputs: Optional[Dict[str, Any]] = None,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Request:
-    """Open a new request — mints request_id, opens a parent LangSmith RunTree,
-    and returns an opaque handle.
-
-    The RunTree (when LangSmith enabled) serves as parent for any child runs
-    emitted via record_voice_event / record_tool, and is also installed as the
-    ambient tracing_context so wrap_llm_client-wrapped LLM calls nest under it.
-    Closed by finish_request().
+    """Open a new request — mints request_id, opens a parent OTel span,
+    activates it as the current span so any wrapped LLM call or child verb
+    nests underneath. Closed by finish_request().
     """
     md = dict(metadata or {})
 
-    # Session-scoped tenant_id propagation (see plan §15.5)
+    # Session-scoped tenant_id propagation (plan §15.5).
     tenant_id = md.pop("tenant_id", None) or md.pop("customer_id", None)
     if tenant_id and session_id:
         _session_tenant_cache[session_id] = tenant_id
@@ -146,53 +152,52 @@ def start_request(
         agent_id=resolved_agent_id,
         session_id=session_id,
         tenant_id=tenant_id,
-        user_id_hash=user_id,  # caller is responsible for hashing — never raw user_id
+        user_id_hash=user_id,
         inputs=dict(inputs or {}),
         metadata=md,
     )
     req._state["started_at"] = time.perf_counter()
 
-    # Open the langsmith parent run + ambient tracing_context, if enabled.
-    # Propagate the platform correlation keys (plan §9) onto every run so
-    # dashboards can pivot by env / tenant / agent / service.
-    base_metadata: Dict[str, Any] = {
-        "request_id": request_id,
-        "request_type": request_type,
-        "session_id": session_id,
-        "agent_id": resolved_agent_id,
-        "tenant_id": tenant_id,
-    }
-    if _config is not None:
-        agent_cfg = _config.agent
-        base_metadata.update(
-            environment=agent_cfg.environment,
-            agent_type=agent_cfg.agent_type,
-            modality=agent_cfg.modality,
-            service=agent_cfg.service,
+    tracer = otel_init.get_tracer()
+    if tracer is None:
+        return req
+
+    # Open the parent span. Use a server-kind span so DD shows it correctly
+    # in service map (incoming request).
+    try:
+        from opentelemetry import context, trace
+        from opentelemetry.trace import SpanKind
+
+        span = tracer.start_span("agent.request", kind=SpanKind.SERVER)
+        # Standard correlation keys — every span carries these.
+        span.set_attribute("request.id", request_id)
+        span.set_attribute("request.type", request_type)
+        if session_id:
+            span.set_attribute("session.id", session_id)
+        if tenant_id:
+            span.set_attribute("tenant.id", tenant_id)
+        if resolved_agent_id:
+            span.set_attribute("agent.id", resolved_agent_id)
+
+        # Backend-specific attribute decoration.
+        ls.decorate_request_span(
+            span,
+            request_type=request_type,
+            session_id=session_id,
+            inputs=req.inputs,
+            metadata=md,
         )
-        if agent_cfg.version:
-            base_metadata["version"] = agent_cfg.version
-    base_metadata.update(md)
+        dd.decorate_request_span(span, request_type=request_type, inputs=req.inputs)
 
-    handles = ls.open_request_run(
-        name="agent.request",
-        inputs=req.inputs,
-        metadata=base_metadata,
-    )
-    if handles is not None:
-        rt, cm = handles
-        req._state["run_tree"] = rt
-        req._state["tracing_cm"] = cm
+        # Activate this span as the current span so child verbs and
+        # auto-instrumented LLM calls nest under it.
+        ctx = trace.set_span_in_context(span)
+        token = context.attach(ctx)
 
-    # Open the Datadog APM span. Independent of LangSmith — both, either, or
-    # neither may be enabled.
-    dd_span = dd.open_request_span(
-        name="agent.request",
-        inputs=req.inputs,
-        metadata=base_metadata,
-    )
-    if dd_span is not None:
-        req._state["dd_span"] = dd_span
+        req._state["span"] = span
+        req._state["context_token"] = token
+    except Exception as e:
+        logger.warning(f"[obs] start_request OTel span failed: {e}")
 
     return req
 
@@ -207,44 +212,22 @@ def record_tool(
     error: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Record a tool invocation — emits a child run under both the LangSmith
-    parent RunTree and the Datadog parent span when present."""
-    parent_rt = request._state.get("run_tree")
-    parent_dd = request._state.get("dd_span")
-    outputs_dict = {"output": output} if output is not None else None
-
-    if ls.ENABLED and parent_rt is not None:
-        ls.emit_child_run(
-            parent_rt,
-            name=f"tool.{name}",
-            run_type="tool",
-            inputs=input or {},
-            outputs=outputs_dict,
-            error=error,
-            metadata=metadata,
-        )
-    elif ls.ENABLED:
-        # Fallback: no parent RunTree → standalone traceable (back-compat).
-        @ls.traceable(name=f"tool.{name}", run_type="tool", **(metadata or {}))
-        def _emit(input: Any) -> Any:
+    """Emit a child OTel span for a tool invocation."""
+    tracer = otel_init.get_tracer()
+    if tracer is None:
+        return
+    try:
+        with tracer.start_as_current_span(f"tool.{name}") as span:
+            ls.decorate_child_span(
+                span, kind="tool", inputs=input, metadata=metadata
+            )
+            if output is not None:
+                span.set_attribute("tool.output", str(output)[:2000])
             if error:
-                raise RuntimeError(error)
-            return output
-
-        try:
-            _emit(input)
-        except RuntimeError:
-            pass
-
-    if dd.ENABLED and parent_dd is not None:
-        dd.emit_child_span(
-            parent_dd,
-            name=f"tool.{name}",
-            inputs=input or {},
-            outputs=outputs_dict,
-            error=error,
-            metadata=metadata,
-        )
+                span.set_attribute("error", True)
+                span.set_attribute("error.message", error[:500])
+    except Exception as e:
+        logger.warning(f"[obs] record_tool '{name}' failed: {e}")
 
 
 # ─── 4. record_quality ───────────────────────────────────────────
@@ -255,18 +238,25 @@ def record_quality(
     *,
     comment: Optional[str] = None,
 ) -> None:
-    """Record a product quality metric.
+    """Stamp a product quality metric on the current request span.
 
-    In v0 we accept the value but only log it — LangSmith feedback API
-    integration lands in v0.1. The primary path is LangSmith scheduled
-    evaluators (see plan §15.3); record_quality() is for fast-path
-    deterministic checks.
+    LangSmith scheduled evaluators still run on trace I/O (plan §15.3).
+    This verb is the fast-path for deterministic checks (e.g.
+    "tool_returned_data": True/False).
     """
     if _config and metric not in _config.quality_metrics and _config.quality_metrics:
         logger.warning(
             f"[obs] record_quality: metric '{metric}' not in config.quality_metrics "
             f"({_config.quality_metrics})"
         )
+    span = request._state.get("span")
+    if span is not None:
+        try:
+            span.set_attribute(f"quality.{metric}", str(value) if value is not None else "")
+            if comment:
+                span.set_attribute(f"quality.{metric}.comment", comment[:500])
+        except Exception:  # pragma: no cover
+            pass
     logger.info(
         f"[obs] quality {metric}={value} request_id={request.request_id} "
         f"comment={comment!r}"
@@ -282,14 +272,19 @@ def record_voice_event(
     audio_wav: Optional[bytes] = None,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Record a voice event (asr_finalized / tts_finished / barge_in / ...).
+    """Emit a child OTel span for a voice event (asr_finalized / tts_finished /
+    barge_in / ...).
 
-    Emits a child run under both the LangSmith parent RunTree and the Datadog
-    parent span when present. Audio is attached only to the LangSmith run
-    (Datadog doesn't store binary attachments).
+    `audio_wav` is accepted for API compatibility but ignored — OTel has no
+    binary attachment primitive. Audio playback returns in v0.2 via the S3
+    audio path (plan §8.4). A one-time warning fires per process.
     """
-    parent_rt = request._state.get("run_tree")
-    parent_dd = request._state.get("dd_span")
+    tracer = otel_init.get_tracer()
+    if tracer is None:
+        return
+
+    if audio_wav:
+        ls.warn_audio_dropped(event)
 
     inputs: Dict[str, Any] = {"event": event}
     if metrics:
@@ -297,42 +292,25 @@ def record_voice_event(
     if metadata:
         inputs.update(metadata)
 
-    audio_bytes = len(audio_wav) if audio_wav else None
-    outputs = {"event": event, "audio_bytes": audio_bytes}
-
-    if ls.ENABLED and parent_rt is not None:
-        ls.emit_child_run(
-            parent_rt,
-            name=f"voice.{event}",
-            run_type="tool",
-            inputs=inputs,
-            outputs=outputs,
-            audio_wav=audio_wav,
-            audio_name=f"audio_{event}",
-            metadata={"component": "voice", **(metadata or {})},
-        )
-    elif ls.ENABLED:
-        # Fallback: standalone child via @traceable + ambient context.
-        md = dict(metadata or {})
-        if metrics:
-            md["metrics"] = metrics
-
-        @ls.traceable(name=f"voice.{event}", run_type="tool", component="voice", **md)
-        def _emit() -> dict:
+    try:
+        with tracer.start_as_current_span(f"voice.{event}") as span:
+            span.set_attribute("voice.event", event)
+            if metrics:
+                for k, v in metrics.items():
+                    if v is not None:
+                        span.set_attribute(f"voice.metrics.{k}", v)
+            ls.decorate_child_span(
+                span,
+                kind="tool",
+                inputs=inputs,
+                metadata={"component": "voice", **(metadata or {})},
+            )
             if audio_wav:
-                ls._attach_audio(f"audio_{event}", audio_wav, "audio/wav")
-            return outputs
-
-        _emit()
-
-    if dd.ENABLED and parent_dd is not None:
-        dd.emit_child_span(
-            parent_dd,
-            name=f"voice.{event}",
-            inputs=inputs,
-            outputs=outputs,
-            metadata={"component": "voice", **(metadata or {})},
-        )
+                # Don't ship the bytes — just the length so dashboards can
+                # filter "events with audio" without the payload.
+                span.set_attribute("voice.audio_bytes", len(audio_wav))
+    except Exception as e:
+        logger.warning(f"[obs] record_voice_event '{event}' failed: {e}")
 
 
 # ─── 6. finish_request ───────────────────────────────────────────
@@ -343,26 +321,42 @@ def finish_request(
     outputs: Optional[Dict[str, Any]] = None,
     error: Optional[str] = None,
 ) -> None:
-    """Close the request — finalizes the LangSmith RunTree + ambient
-    tracing_context, finalizes the Datadog APM span, and logs a summary.
+    """Close the request — finalizes the parent OTel span + logs a summary.
     Idempotent: safe to call from multiple except branches.
 
-    `status` is stamped as an output tag (`status=success|interrupted|error|…`)
-    so both LangSmith and Datadog can group by it without using the error
-    flag. `error` should only be set for true exceptions — interrupted/barge-in
-    is a normal product outcome, not an error.
+    `status` is stamped as a span attribute (`status=success|interrupted|
+    error|...`) so both LangSmith and Datadog can group by it. `error`
+    should only be set for true exceptions — interrupted/barge-in is a
+    normal product outcome, not an error.
     """
-    final_outputs: Dict[str, Any] = dict(outputs or {})
-    final_outputs.setdefault("status", status)
+    span = request._state.pop("span", None)
+    token = request._state.pop("context_token", None)
 
-    rt = request._state.pop("run_tree", None)
-    cm = request._state.pop("tracing_cm", None)
-    if rt is not None or cm is not None:
-        ls.close_request_run(rt, cm, outputs=final_outputs, error=error)
+    if span is not None:
+        try:
+            span.set_attribute("status", status)
+            for k, v in (outputs or {}).items():
+                if v is not None:
+                    span.set_attribute(f"output.{k}", str(v)[:2000])
+            # LangSmith Outputs panel reads `output.value` (JSON). Per-key
+            # `output.{k}` above stays for Datadog tag-filter use.
+            ls.decorate_finish_span(span, outputs=outputs)
+            if error:
+                from opentelemetry.trace import Status, StatusCode
 
-    dd_span = request._state.pop("dd_span", None)
-    if dd_span is not None:
-        dd.close_request_span(dd_span, outputs=final_outputs, error=error)
+                span.set_attribute("error", True)
+                span.set_attribute("error.message", error[:500])
+                span.set_status(Status(StatusCode.ERROR, error[:200]))
+            span.end()
+        except Exception as e:  # pragma: no cover
+            logger.warning(f"[obs] finish_request span end failed: {e}")
+
+    if token is not None:
+        try:
+            from opentelemetry import context
+            context.detach(token)
+        except Exception:  # pragma: no cover
+            pass
 
     duration_hint = request._state.get("started_at")
     duration_ms = (
@@ -374,11 +368,7 @@ def finish_request(
     )
 
 
-# ─── 7. Session lifecycle + event mirror (PG-backed) ─────────────
-# These verbs delegate to the postgres_db exporter. They replace propio_one's
-# monitor_service.start_session / end_session / broadcast — same SQL, same
-# pg_notify pattern, but driven from the SDK so every agent gets it.
-
+# ─── 7. Session lifecycle + event mirror (PG-backed, NOT OTel) ───
 async def start_session(
     session_id: str,
     *,
@@ -386,23 +376,21 @@ async def start_session(
     env: Optional[str] = None,
     agent_id: Optional[str] = None,
 ) -> None:
-    """Register a new monitored session in Postgres + start its heartbeat.
-
-    `agent_id` defaults to the configured agent. `env` defaults to the
-    configured environment. Idempotent on session_id collision.
-    """
+    """Register a session in Postgres + start heartbeat. PG path; unchanged
+    by OTel migration."""
     resolved_agent_id = agent_id or (_config.agent.agent_id if _config else None)
     resolved_env = env or (_config.agent.environment if _config else None)
+    if not resolved_env:
+        raise RuntimeError(
+            "start_session: env unresolved. Either call init_agent() first "
+            "(which validates agent.environment) or pass env= explicitly."
+        )
     await _postgres_db.start_session(
-        session_id,
-        config=config,
-        env=resolved_env,
-        agent_id=resolved_agent_id,
+        session_id, env=resolved_env, config=config, agent_id=resolved_agent_id
     )
 
 
 async def end_session(session_id: str) -> None:
-    """Mark a session ended + cancel its heartbeat."""
     await _postgres_db.end_session(session_id)
 
 
@@ -412,32 +400,29 @@ async def broadcast_event(
     session_id: str,
     agent_id: Optional[str] = None,
 ) -> None:
-    """Fire-and-forget INSERT of a pipeline event into Postgres + pg_notify.
-
-    Returns immediately — the actual SQL runs in a background task. Listeners
-    (observability_platform) consume via the 'monitor_events' notify channel.
-    """
+    """Fire-and-forget INSERT of a pipeline event into Postgres + pg_notify."""
     resolved_agent_id = agent_id or (_config.agent.agent_id if _config else None)
     await _postgres_db.broadcast_event(
-        event,
-        session_id=session_id,
-        agent_id=resolved_agent_id,
+        event, session_id=session_id, agent_id=resolved_agent_id
     )
 
 
 # ─── Helpers ─────────────────────────────────────────────────────
 def wrap_llm_client(client: Any) -> Any:
-    """Wrap an OpenAI / AsyncOpenAI client for auto-tracing.
+    """Wrap an OpenAI / AsyncOpenAI client so every call auto-emits an
+    OTel span carrying gen_ai.* semantic-convention attributes.
 
-    Identical to the function-level wrap_openai — kept under a verb-style name
-    so the verb-only API is self-contained.
+    Under OTel migration this delegates to OpenAI auto-instrumentation
+    rather than langsmith.wrappers.wrap_openai.
     """
-    return ls.wrap_openai(client)
+    return otel_init.instrument_openai_client(client)
 
 
 def flush(timeout_ms: int = 5000) -> None:
-    """Flush pending exports. Called by atexit hook + explicitly for short-lived agents."""
-    # LangSmith client flushes on its own; Datadog APM flushes via ddtrace's
-    # own atexit. Only the Logs handler needs explicit flushing.
-    dd_logs.flush(timeout_ms=timeout_ms)
+    """Flush pending exports. Called by atexit + explicitly for short-lived
+    agents."""
+    try:
+        otel_init.shutdown(timeout_ms=timeout_ms)
+    except Exception:  # pragma: no cover
+        pass
     _postgres_db.shutdown(timeout_ms=timeout_ms)

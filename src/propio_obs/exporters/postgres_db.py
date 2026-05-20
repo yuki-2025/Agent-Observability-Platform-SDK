@@ -147,8 +147,8 @@ class PostgresDBExporter:
         self,
         session_id: str,
         *,
+        env: str,
         config: Optional[Dict[str, Any]] = None,
-        env: Optional[str] = None,
         agent_id: Optional[str] = None,
     ) -> None:
         """Register a new session row + kick heartbeat.
@@ -159,6 +159,11 @@ class PostgresDBExporter:
         the row so dashboards can filter by agent. After Phase 2 (monitor_service
         deleted), the UPDATE branch becomes dead code — harmless.
         """
+        if not env:
+            raise ValueError(
+                "[obs/postgres_db] start_session requires env; "
+                "AgentConfig.load() should have resolved it before reaching here"
+            )
         if not self.enabled:
             return
         pool = await self._ensure_pool()
@@ -175,11 +180,11 @@ class PostgresDBExporter:
                     "ON CONFLICT (id) DO UPDATE "
                     "SET agent_id = EXCLUDED.agent_id "
                     "WHERE sessions.agent_id IS NULL",
-                    session_id, now, config_str, env or "dev", agent_id,
+                    session_id, now, config_str, env, agent_id,
                 )
             logger.info(
                 f"[obs/postgres_db] started session {session_id} "
-                f"(agent_id={agent_id}, env={env or 'dev'})"
+                f"(agent_id={agent_id}, env={env})"
             )
             # Kick heartbeat task; one per session.
             if session_id not in self._heartbeats:
