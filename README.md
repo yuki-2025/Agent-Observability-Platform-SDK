@@ -25,7 +25,7 @@ Any Propio agent that wants to observability-enable its calls:
 
 ## High Level Design
 v1 transport: OpenTelemetry (OTel) — agent emits OTel spans / logs / metrics; an OTel Collector (in-process or sidecar) fans out to backends. Audio is out-of-band — uploaded directly to S3, with a metadata pointer in Postgres + a span attribute referencing the S3 key.
-
+```bash
 ┌─────────────────────────────────────────────────────────────┐
 │                  Agent code (any framework)                 │
 │   import obs_sdk as obs                                  │
@@ -57,6 +57,7 @@ v1 transport: OpenTelemetry (OTel) — agent emits OTel spans / logs / metrics; 
    │Smith │ │     │ │ (events)  │
    │OTLP  │ │OTLP │ │ Postgres  │
    └──────┘ └─────┘ └───────────┘
+```
 ---
 
 ## Install
