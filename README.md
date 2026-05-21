@@ -1,14 +1,14 @@
-# propio-obs-sdk
+# Agent Observability Platform SDK (Obs_SDK)
 
-Unified observability SDK for Propio agents. One Python package, one config file, one verb interface — fan-out to LangSmith / Datadog / Postgres without each agent importing vendor SDKs directly.
+Unified observability SDK for Any agents. One Python package, one config file, one verb interface — fan-out to LangSmith / Datadog / Postgres without each agent importing vendor SDKs directly.
 
-> **Status: v0.0.1** — validated in production on `propio_agent`. Supports LangSmith, Datadog APM, Datadog Logs, Postgres event-mirror.
+> **Status: v0.0.1** — validated in production. Supports LangSmith, Datadog APM, Datadog Logs, Postgres event-mirror.
 
 ---
 
 ## Who is this for?
 
-Any Propio agent that wants to observability-enable its calls:
+Any agent that wants to observability-enable its calls:
 
 | Agent type | `modality` | What you track |
 |---|---|---|
@@ -21,7 +21,7 @@ Any Propio agent that wants to observability-enable its calls:
 
 - **Traces** (OTel spans) → LangSmith + Datadog APM
 - **Logs** (Python `logger.*`) → Datadog Logs
-- **Business events** (async Postgres writes) → Propio internal DB
+- **Business events** (async Postgres writes) → internal DB
 
 ## High Level Design
 v1 transport: OpenTelemetry (OTel) — agent emits OTel spans / logs / metrics; an OTel Collector (in-process or sidecar) fans out to backends. Audio is out-of-band — uploaded directly to S3, with a metadata pointer in Postgres + a span attribute referencing the S3 key.
@@ -53,7 +53,7 @@ v1 transport: OpenTelemetry (OTel) — agent emits OTel spans / logs / metrics; 
        └─┬─────┬─────┬────────┘    └───────────────────┘
          │     │     │
    ┌─────▼┐ ┌──▼──┐ ┌▼──────────┐
-   │Lang- │ │ DD  │ │ Propio DB │
+   │Lang- │ │ DD  │ │  DB │
    │Smith │ │     │ │ (events)  │
    │OTLP  │ │OTLP │ │ Postgres  │
    └──────┘ └─────┘ └───────────┘
@@ -63,10 +63,10 @@ v1 transport: OpenTelemetry (OTel) — agent emits OTel spans / logs / metrics; 
 ## Install
 
 ```bash
-pip install propio-obs-sdk
+pip install obs-sdk
 ```
 
-Or inside the Propio monorepo as an editable workspace dependency:
+Or inside the monorepo as an editable workspace dependency:
 
 ```bash
 uv add --editable ../obs_sdk
@@ -130,7 +130,7 @@ backends:
   datadog_logs:
     enabled: false
   postgres_db:
-    enabled: true          # default — Propio internal DB
+    enabled: true          # default — internal DB
 
 otel:
   collector_endpoint: http://localhost:4318
@@ -139,7 +139,7 @@ otel:
 ### 2. Initialize once at startup
 
 ```python
-import propio_obs as obs
+import obs_sdk as obs
 
 obs.init_agent("observability.yml")   # or pass a dict directly
 ```
@@ -158,10 +158,10 @@ client = obs.wrap_llm_client(AsyncOpenAI(api_key=api_key))
 
 ## Voice Agent — Full Turn Example
 
-`propio_agent` uses this pattern on every user turn. A full voice turn:
+voice_agent can uses this pattern on every user turn. A full voice turn:
 
 ```python
-import propio_obs as obs
+import obs_sdk as obs
 
 # ── Per session (once per WebSocket connection) ──────────────────
 await obs.start_session(
@@ -267,7 +267,7 @@ Every event type (`user_transcript`, `turn_metrics`, `interruption`, `error`, �
 For a REST API chatbot or text agent, the pattern is the same but without voice-specific events:
 
 ```python
-import propio_obs as obs
+import obs_sdk as obs
 
 # ── Per session ───────────────────────────────────────────────────
 await obs.start_session(
@@ -380,11 +380,11 @@ Full `observability.yml` schema:
 ```yaml
 # ── Required ──────────────────────────────────────────────────────
 agent:
-  agent_id: str                    # unique across all Propio agents
+  agent_id: str                    # unique across all agents
   agent_type: realtime_agent | chat_agent | tool_agent | batch | workflow
   modality: text | voice | multimodal
   service: str                     # Datadog service tag
-  environment: dev | qa | staging | prod  # required; falls back to PROPIO_ENV
+  environment: dev | qa | staging | prod  # required; falls back to ENV
 
 # ── Optional ─────────────────────────────────────────────────────
   agent_name: str                  # human-readable
@@ -428,7 +428,7 @@ backends:
     exclude_loggers: [ddtrace, urllib3, datadog, httpx]
 
   postgres_db:
-    enabled: bool                  # default True (Propio internal DB)
+    enabled: bool                  # default True (internal DB)
     url_env: str                   # default POSTGRES_DB_URL_<env> from platform
 
 # ── Wire config ───────────────────────────────────────────────────
