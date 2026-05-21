@@ -23,6 +23,40 @@ Any Propio agent that wants to observability-enable its calls:
 - **Logs** (Python `logger.*`) → Datadog Logs
 - **Business events** (async Postgres writes) → Propio internal DB
 
+## High Level Design
+v1 transport: OpenTelemetry (OTel) — agent emits OTel spans / logs / metrics; an OTel Collector (in-process or sidecar) fans out to backends. Audio is out-of-band — uploaded directly to S3, with a metadata pointer in Postgres + a span attribute referencing the S3 key.
+
+┌─────────────────────────────────────────────────────────────┐
+│                  Agent code (any framework)                 │
+│   import obs_sdk as obs                                  │
+│   obs.init_agent(...)                                       │
+│   req = obs.start_request(...)                              │
+│   obs.record_tool(req, ...)                                 │
+│   obs.record_voice_event(req, ..., audio_wav=...)           │
+│   obs.finish_request(req)                                   │
+└─────────────────────────────┬───────────────────────────────┘
+                              │
+                  ┌───────────▼─────────────┐
+                  │     obs_sdk (SDK)    │
+                  ├─────────────────────────┤
+                  │  verb layer             │
+                  │  ↓                      │
+                  │  channel router         │
+                  │  ├─→ OTel emit (spans/logs/metrics)
+                  │  └─→ S3 audio uploader  │ (only for audio channel)
+                  └─┬───────────────────┬───┘
+                    │                   │
+       ┌────────────▼─────────┐    ┌────▼──────────────┐
+       │   OTel Collector     │    │  S3 (audio blobs) │
+       │  (per-process or     │    │  + Postgres       │
+       │   sidecar deployment)│    │  (metadata index) │
+       └─┬─────┬─────┬────────┘    └───────────────────┘
+         │     │     │
+   ┌─────▼┐ ┌──▼──┐ ┌▼──────────┐
+   │Lang- │ │ DD  │ │ Propio DB │
+   │Smith │ │     │ │ (events)  │
+   │OTLP  │ │OTLP │ │ Postgres  │
+   └──────┘ └─────┘ └───────────┘
 ---
 
 ## Install
